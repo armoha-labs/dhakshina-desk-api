@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+/dhakshina
+/bin/
+*.test
+*.out
+.DS_Store

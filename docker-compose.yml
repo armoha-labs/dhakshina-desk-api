@@ -1,0 +1,31 @@
+# Local development: a one-node MongoDB replica set (transactions need one)
+# and the API on :8080. Never point this at the live cluster.
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }"]
+      interval: 5s
+      retries: 20
+    volumes: [mongo-data:/data/db]
+  api:
+    build: .
+    depends_on:
+      mongo: { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+    ports: ["8080:8080"]
+  indexes:
+    build: .
+    depends_on:
+      mongo: { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+    command: ["indexes"]
+    restart: "no"
+volumes:
+  mongo-data:

@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
+          --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Start a one-node replica set
+        run: |
+          docker exec ${{ job.services.mongo.id }} mongod --version >/dev/null
+          # The service container runs without --replSet, so start a second
+          # mongod with one for the transaction tests.
+          docker run -d --name rs --network host mongo:7 --replSet rs0 --port 27018 --bind_ip_all
+          for i in $(seq 1 30); do docker exec rs mongosh --port 27018 --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27018"}]}).ok' && break; sleep 2; done
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test ./...
+        env:
+          MONGODB_TEST_URI: mongodb://localhost:27018/?replicaSet=rs0
+      - run: docker build -t dhakshina-desk-api .
