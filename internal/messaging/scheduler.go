@@ -39,6 +39,9 @@ func (w *Worker) Schedule(ctx context.Context) {
 		if err := w.DailyPass(ctx, w.Now()); err != nil {
 			slog.Error("daily_pass_failed", "err", err)
 		}
+		if err := w.QueueOpenErasures(ctx); err != nil {
+			slog.Error("queue_erasures_failed", "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return

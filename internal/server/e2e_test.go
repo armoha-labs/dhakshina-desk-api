@@ -127,6 +127,143 @@ func (e *env) login(phone string) map[string]any {
 	return e.want(e.do("POST", "/v1/auth/otp/verify", "", map[string]any{"request_id": st["request_id"], "code": st["dev_code"], "device_id": ids.UUIDv7()}), 200).Body
 }
 
+// DELETE /v1/me must really remove the class: only the tax record stays, and
+// no other class loses anything.
+func TestAccountErasure(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	newClass := func(phone, name string) (string, string, string) {
+		v := e.login(phone)
+		c := e.want(e.do("POST", "/v1/tenants", s(v["access_token"]), map[string]any{"name": name}), 201).Body
+		return s(m(v["user"])["id"]), s(m(c["tenant"])["id"]), s(c["access_token"])
+	}
+	userID, gone, tok := newClass("9000000011", "Leaving")
+	_, kept, keptTok := newClass("9000000012", "Staying")
+	if userID == "" || gone == "" || kept == "" {
+		t.Fatalf("missing ids: user %q, classes %q %q", userID, gone, kept)
+	}
+
+	// One row in every class collection, for both classes. Held jobs are never
+	// claimed, so the only job the worker runs below is the erasure.
+	tables := []string{"batches", "fee_plans", "guardians", "students", "enrolments", "charges", "adjustments", "payment_claims", "messages", "reminders", "consents", "jobs", "usage_counters", "subscriptions", "payments", "invoices"}
+	for _, tid := range []string{gone, kept} {
+		for _, c := range tables {
+			doc := bson.M{"_id": ids.UUIDv7(), "tenant_id": tid, "note": "about a child"}
+			switch c {
+			case "guardians":
+				doc["phone_hash"] = "only-" + tid
+			case "jobs":
+				doc["status"] = "held"
+			}
+			if _, err := e.a.M.C(c).InsertOne(ctx, doc); err != nil {
+				t.Fatalf("seed %s: %v", c, err)
+			}
+		}
+		if _, err := e.a.M.C("guardians").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": tid, "phone_hash": "shared"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range []string{"only-" + gone, "only-" + kept, "shared"} {
+		if _, err := e.a.M.C("inbound_messages").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "wa_id": h, "from_hash": h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.a.M.C("data_requests").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": gone, "kind": "erase", "status": "open"}); err != nil {
+		t.Fatal(err)
+	}
+
+	count := func(c string, f bson.M) int64 {
+		t.Helper()
+		n, err := e.a.M.C(c).CountDocuments(ctx, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	e.want(e.do("DELETE", "/v1/me", tok, nil), 202)
+	if _, err := e.mods.Worker.RunOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []string{"batches", "fee_plans", "guardians", "students", "enrolments", "charges", "adjustments", "payment_claims", "messages", "reminders", "consents", "jobs", "usage_counters", "subscriptions", "change_log", "memberships"} {
+		if n := count(c, bson.M{"tenant_id": gone}); n != 0 {
+			t.Errorf("%s: %d rows left for the erased class", c, n)
+		}
+		if c != "change_log" && count(c, bson.M{"tenant_id": kept}) == 0 {
+			t.Errorf("%s: the other class lost its rows", c)
+		}
+	}
+	if count("tenants", bson.M{"_id": gone}) != 0 || count("users", bson.M{"_id": userID}) != 0 {
+		t.Error("class or user still there")
+	}
+	if count("tenants", bson.M{"_id": kept}) != 1 {
+		t.Error("the other class was erased")
+	}
+	// The tax record stays, without its free text.
+	if count("payments", bson.M{"tenant_id": gone}) != 1 || count("invoices", bson.M{"tenant_id": gone}) != 1 {
+		t.Error("payments and invoices must be kept")
+	}
+	if count("payments", bson.M{"tenant_id": gone, "note": bson.M{"$exists": true}}) != 0 {
+		t.Error("payment note kept")
+	}
+	if count("payments", bson.M{"tenant_id": kept, "note": bson.M{"$exists": true}}) != 1 {
+		t.Error("the other class's payment was changed")
+	}
+	// A parent also in the other class keeps their messages.
+	if count("inbound_messages", bson.M{"from_hash": "only-" + gone}) != 0 {
+		t.Error("guardian messages left")
+	}
+	if count("inbound_messages", bson.M{"from_hash": bson.M{"$in": bson.A{"shared", "only-" + kept}}}) != 2 {
+		t.Error("another class's guardian messages removed")
+	}
+	if count("data_requests", bson.M{"tenant_id": gone, "kind": "erase"}) != 0 {
+		t.Error("parent request left")
+	}
+	if count("data_requests", bson.M{"tenant_id": gone, "kind": "account_erase", "status": "done"}) != 1 {
+		t.Error("request not marked done")
+	}
+	if count("audit_log", bson.M{"tenant_id": gone, "action": "account_erased"}) != 1 {
+		t.Error("no audit entry")
+	}
+
+	// A token issued before the erasure cannot sync the class back in.
+	e.do("POST", "/v1/sync", tok, map[string]any{"since_seq": 0, "changes": []any{
+		map[string]any{"table": "batches", "op": "upsert", "id": ids.UUIDv7(), "hlc": hlc("x", 1), "data": map[string]any{"name": "Back again"}},
+	}})
+	if n := count("batches", bson.M{"tenant_id": gone}); n != 0 {
+		t.Errorf("stale token wrote %d rows into the erased class", n)
+	}
+
+	// Signing in again is a new account with no class.
+	again := e.login("9000000011")
+	if s(m(again["user"])["id"]) == userID || len(l(again["memberships"])) != 0 {
+		t.Errorf("sign-in after erasure: %v", again)
+	}
+	e.want(e.do("POST", "/v1/sync", keptTok, map[string]any{}), 200)
+
+	// A request left open from before the job existed still gets carried out.
+	v := e.login("9000000013")
+	c := e.want(e.do("POST", "/v1/tenants", s(v["access_token"]), map[string]any{"name": "Old request"}), 201).Body
+	oldTenant := s(m(c["tenant"])["id"])
+	if _, err := e.a.M.C("data_requests").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": oldTenant, "user_id": m(v["user"])["id"], "kind": "account_erase", "status": "open"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass must not queue a duplicate
+		if err := e.mods.Worker.QueueOpenErasures(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count("jobs", bson.M{"kind": "erase_account", "status": "queued"}); n != 1 {
+		t.Fatalf("erase jobs queued: %d", n)
+	}
+	if _, err := e.mods.Worker.RunOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count("tenants", bson.M{"_id": oldTenant}) != 0 {
+		t.Error("old open request was not carried out")
+	}
+}
+
 func hlc(dev string, i int) string {
 	return fmt.Sprintf("%s|%04x|%s", val.ISO(time.Now()), i, dev)
 }

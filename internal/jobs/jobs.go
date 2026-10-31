@@ -34,6 +34,8 @@ const (
 	WAEvent     = "wa_event"     // ref: wa_events._id
 	DailyTenant = "daily_tenant" // tenant_id; payload.date
 	NotifyOwner = "notify_owner" // payload: template, params, user_id, button
+	// EraseAccount has no tenant_id, so erasing a class never deletes this job.
+	EraseAccount = "erase_account" // ref: data_requests._id
 )
 
 const Lease = 2 * time.Minute
