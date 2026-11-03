@@ -1,12 +1,14 @@
 package identity
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/armohalabs/dhakshina-desk-api/internal/jobs"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/httpx"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/ids"
 	"github.com/armohalabs/dhakshina-desk-api/internal/privacy"
@@ -126,7 +128,13 @@ func (s *Service) deleteMe(w http.ResponseWriter, r *http.Request) error {
 		tid = p.TenantID
 	}
 	now := time.Now()
-	if _, err := s.M.C("data_requests").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": tid, "user_id": p.UserID, "kind": "account_erase", "status": "open", "created_at": now}); err != nil {
+	reqID := ids.UUIDv7()
+	if err := s.M.Tx(ctx, func(ctx context.Context) error {
+		if _, err := s.M.C("data_requests").InsertOne(ctx, bson.M{"_id": reqID, "tenant_id": tid, "user_id": p.UserID, "kind": privacy.AccountErase, "status": "open", "created_at": now}); err != nil {
+			return err
+		}
+		return jobs.Enqueue(ctx, s.M.DB, jobs.Job{Kind: jobs.EraseAccount, Ref: reqID})
+	}); err != nil {
 		return err
 	}
 	if _, err := s.M.C("refresh_tokens").UpdateMany(ctx, bson.M{"user_id": p.UserID}, bson.M{"$set": bson.M{"revoked": true, "revoked_at": now}}); err != nil {

@@ -37,8 +37,12 @@ func (s *Service) Routes(r chi.Router) {
 		r.Method("POST", "/admin/tenants/{id}/status", httpx.Handler(s.setStatus))
 		r.Method("POST", "/admin/tenants/{id}/founder", httpx.Handler(s.setFounder))
 		r.Method("POST", "/admin/tenants/{id}/flags", httpx.Handler(s.setFlags))
+		r.Method("GET", "/admin/revenue", httpx.Handler(s.revenue))
 		r.Method("GET", "/admin/audit", httpx.Handler(s.audit))
 		r.Method("GET", "/admin/export.csv", httpx.Handler(s.export))
+		r.Method("GET", "/admin/settings/payments", httpx.Handler(s.paymentSettings))
+		r.Method("POST", "/admin/settings/payments", httpx.Handler(s.savePaymentSettings))
+		r.Method("POST", "/admin/settings/payments/test", httpx.Handler(s.testPaymentKeys))
 	})
 }
 

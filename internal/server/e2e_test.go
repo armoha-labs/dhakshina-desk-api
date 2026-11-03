@@ -21,6 +21,7 @@ import (
 
 	"github.com/armohalabs/dhakshina-desk-api/internal/admin"
 	"github.com/armohalabs/dhakshina-desk-api/internal/app"
+	"github.com/armohalabs/dhakshina-desk-api/internal/billing/gateway"
 	"github.com/armohalabs/dhakshina-desk-api/internal/config"
 	"github.com/armohalabs/dhakshina-desk-api/internal/indexes"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/db"
@@ -115,6 +116,49 @@ func l(v any) []any          { x, _ := v.([]any); return x }
 func s(v any) string         { x, _ := v.(string); return x }
 func n(v any) int64          { x, _ := v.(float64); return int64(x) }
 
+// The income report is staff only, counts only paid invoices and is logged.
+func TestRevenueReport(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	teacher := s(e.login("9000000021")["access_token"])
+	adm := s(e.want(e.do("POST", "/v1/admin/login", "", map[string]any{"email": "staff@example.com", "password": "correct horse battery"}), 200).Body["token"])
+	e.want(e.do("GET", "/v1/admin/revenue", "", nil), 401)
+	e.want(e.do("GET", "/v1/admin/revenue", teacher, nil), 401)
+
+	now := time.Now()
+	tid := ids.UUIDv7()
+	if _, err := e.a.M.C("tenants").InsertOne(ctx, bson.M{"_id": tid, "name": "Paying", "plan": "pro", "status": "active"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, inv := range []bson.M{
+		{"status": "paid", "tenant_id": tid, "paid_at": now},
+		{"status": "created", "tenant_id": tid, "created_at": now},
+		{"status": "paid", "tenant_id": ids.UUIDv7(), "paid_at": now.Add(-40 * 24 * time.Hour)}, // class since erased
+	} {
+		inv["_id"], inv["plan"], inv["billing"], inv["price"], inv["amount"] = ids.UUIDv7(), "pro", "monthly", int64(24900), int64(24900)
+		if _, err := e.a.M.C("invoices").InsertOne(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := e.want(e.do("GET", "/v1/admin/revenue?months=6", adm, nil), 200).Body
+	if n(r["collected"]) != 49800 || n(r["recurring"]) != 24900 || n(r["paying_classes"]) != 1 {
+		t.Fatalf("report: %v", r)
+	}
+	if len(l(r["months"])) != 6 || len(l(r["recent"])) != 2 || len(l(r["plans"])) != 3 {
+		t.Fatalf("report shape: %v", r)
+	}
+	if s(m(l(r["recent"])[0])["class"]) != "Paying" || s(m(l(r["recent"])[1])["class"]) != "" {
+		t.Errorf("recent: %v", r["recent"])
+	}
+	if got := len(l(e.want(e.do("GET", "/v1/admin/revenue", adm, nil), 200).Body["months"])); got != 12 {
+		t.Errorf("default months: %d", got)
+	}
+	n, err := e.a.M.C("audit_log").CountDocuments(ctx, bson.M{"action": "revenue_viewed"})
+	if err != nil || n != 2 {
+		t.Errorf("audit rows: %d, %v", n, err)
+	}
+}
+
 func (e *env) login(phone string) map[string]any {
 	st := e.want(e.do("POST", "/v1/auth/otp/start", "", map[string]any{"phone": phone}), 200).Body
 	if s(st["dev_code"]) == "" {
@@ -125,6 +169,143 @@ func (e *env) login(phone string) map[string]any {
 		e.t.Fatalf("wrong code accepted: %s", bad.Raw)
 	}
 	return e.want(e.do("POST", "/v1/auth/otp/verify", "", map[string]any{"request_id": st["request_id"], "code": st["dev_code"], "device_id": ids.UUIDv7()}), 200).Body
+}
+
+// DELETE /v1/me must really remove the class: only the tax record stays, and
+// no other class loses anything.
+func TestAccountErasure(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	newClass := func(phone, name string) (string, string, string) {
+		v := e.login(phone)
+		c := e.want(e.do("POST", "/v1/tenants", s(v["access_token"]), map[string]any{"name": name}), 201).Body
+		return s(m(v["user"])["id"]), s(m(c["tenant"])["id"]), s(c["access_token"])
+	}
+	userID, gone, tok := newClass("9000000011", "Leaving")
+	_, kept, keptTok := newClass("9000000012", "Staying")
+	if userID == "" || gone == "" || kept == "" {
+		t.Fatalf("missing ids: user %q, classes %q %q", userID, gone, kept)
+	}
+
+	// One row in every class collection, for both classes. Held jobs are never
+	// claimed, so the only job the worker runs below is the erasure.
+	tables := []string{"batches", "fee_plans", "guardians", "students", "enrolments", "charges", "adjustments", "payment_claims", "messages", "reminders", "consents", "jobs", "usage_counters", "subscriptions", "payments", "invoices"}
+	for _, tid := range []string{gone, kept} {
+		for _, c := range tables {
+			doc := bson.M{"_id": ids.UUIDv7(), "tenant_id": tid, "note": "about a child"}
+			switch c {
+			case "guardians":
+				doc["phone_hash"] = "only-" + tid
+			case "jobs":
+				doc["status"] = "held"
+			}
+			if _, err := e.a.M.C(c).InsertOne(ctx, doc); err != nil {
+				t.Fatalf("seed %s: %v", c, err)
+			}
+		}
+		if _, err := e.a.M.C("guardians").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": tid, "phone_hash": "shared"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range []string{"only-" + gone, "only-" + kept, "shared"} {
+		if _, err := e.a.M.C("inbound_messages").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "wa_id": h, "from_hash": h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.a.M.C("data_requests").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": gone, "kind": "erase", "status": "open"}); err != nil {
+		t.Fatal(err)
+	}
+
+	count := func(c string, f bson.M) int64 {
+		t.Helper()
+		n, err := e.a.M.C(c).CountDocuments(ctx, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	e.want(e.do("DELETE", "/v1/me", tok, nil), 202)
+	if _, err := e.mods.Worker.RunOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []string{"batches", "fee_plans", "guardians", "students", "enrolments", "charges", "adjustments", "payment_claims", "messages", "reminders", "consents", "jobs", "usage_counters", "subscriptions", "change_log", "memberships"} {
+		if n := count(c, bson.M{"tenant_id": gone}); n != 0 {
+			t.Errorf("%s: %d rows left for the erased class", c, n)
+		}
+		if c != "change_log" && count(c, bson.M{"tenant_id": kept}) == 0 {
+			t.Errorf("%s: the other class lost its rows", c)
+		}
+	}
+	if count("tenants", bson.M{"_id": gone}) != 0 || count("users", bson.M{"_id": userID}) != 0 {
+		t.Error("class or user still there")
+	}
+	if count("tenants", bson.M{"_id": kept}) != 1 {
+		t.Error("the other class was erased")
+	}
+	// The tax record stays, without its free text.
+	if count("payments", bson.M{"tenant_id": gone}) != 1 || count("invoices", bson.M{"tenant_id": gone}) != 1 {
+		t.Error("payments and invoices must be kept")
+	}
+	if count("payments", bson.M{"tenant_id": gone, "note": bson.M{"$exists": true}}) != 0 {
+		t.Error("payment note kept")
+	}
+	if count("payments", bson.M{"tenant_id": kept, "note": bson.M{"$exists": true}}) != 1 {
+		t.Error("the other class's payment was changed")
+	}
+	// A parent also in the other class keeps their messages.
+	if count("inbound_messages", bson.M{"from_hash": "only-" + gone}) != 0 {
+		t.Error("guardian messages left")
+	}
+	if count("inbound_messages", bson.M{"from_hash": bson.M{"$in": bson.A{"shared", "only-" + kept}}}) != 2 {
+		t.Error("another class's guardian messages removed")
+	}
+	if count("data_requests", bson.M{"tenant_id": gone, "kind": "erase"}) != 0 {
+		t.Error("parent request left")
+	}
+	if count("data_requests", bson.M{"tenant_id": gone, "kind": "account_erase", "status": "done"}) != 1 {
+		t.Error("request not marked done")
+	}
+	if count("audit_log", bson.M{"tenant_id": gone, "action": "account_erased"}) != 1 {
+		t.Error("no audit entry")
+	}
+
+	// A token issued before the erasure cannot sync the class back in.
+	e.do("POST", "/v1/sync", tok, map[string]any{"since_seq": 0, "changes": []any{
+		map[string]any{"table": "batches", "op": "upsert", "id": ids.UUIDv7(), "hlc": hlc("x", 1), "data": map[string]any{"name": "Back again"}},
+	}})
+	if n := count("batches", bson.M{"tenant_id": gone}); n != 0 {
+		t.Errorf("stale token wrote %d rows into the erased class", n)
+	}
+
+	// Signing in again is a new account with no class.
+	again := e.login("9000000011")
+	if s(m(again["user"])["id"]) == userID || len(l(again["memberships"])) != 0 {
+		t.Errorf("sign-in after erasure: %v", again)
+	}
+	e.want(e.do("POST", "/v1/sync", keptTok, map[string]any{}), 200)
+
+	// A request left open from before the job existed still gets carried out.
+	v := e.login("9000000013")
+	c := e.want(e.do("POST", "/v1/tenants", s(v["access_token"]), map[string]any{"name": "Old request"}), 201).Body
+	oldTenant := s(m(c["tenant"])["id"])
+	if _, err := e.a.M.C("data_requests").InsertOne(ctx, bson.M{"_id": ids.UUIDv7(), "tenant_id": oldTenant, "user_id": m(v["user"])["id"], "kind": "account_erase", "status": "open"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass must not queue a duplicate
+		if err := e.mods.Worker.QueueOpenErasures(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count("jobs", bson.M{"kind": "erase_account", "status": "queued"}); n != 1 {
+		t.Fatalf("erase jobs queued: %d", n)
+	}
+	if _, err := e.mods.Worker.RunOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count("tenants", bson.M{"_id": oldTenant}) != 0 {
+		t.Error("old open request was not carried out")
+	}
 }
 
 func hlc(dev string, i int) string {
@@ -340,7 +521,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// Upgrade link, quote, mock checkout, webhook-free mock pay.
 	up := e.want(e.do("POST", "/v1/links/upgrade", tok, nil), 200).Body
-	utok := s(up["dev_url"])[len("https://web.test/subscribe/"):]
+	utok := s(up["url"])[len("https://web.test/subscribe/"):]
 	q := e.want(e.do("GET", "/v1/billing/quote?plan=pro&billing=yearly&token="+utok, "", nil), 200).Body
 	if n(m(q["quote"])["amount"]) != 249900 || m(q["plans"])["pro"] == nil || m(q["tenant"])["students"] == nil {
 		t.Fatalf("quote: %v", q)
@@ -461,6 +642,39 @@ func TestEndToEnd(t *testing.T) {
 	if len(l(au["rows"])) < 6 {
 		t.Fatalf("audit rows: %d", len(l(au["rows"])))
 	}
+	// Payment settings: environment first, then saved from the console with
+	// secrets encrypted and never shown back.
+	ps := e.want(e.do("GET", "/v1/admin/settings/payments", adm, nil), 200).Body
+	if s(ps["source"]) != "env" || s(ps["active"]) != "mock" || s(m(ps["razorpay"])["webhook_url"]) == "" {
+		t.Fatalf("payment settings: %v", ps)
+	}
+	e.want(e.do("GET", "/v1/admin/settings/payments", tok, nil), 401)
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{"key_id": "rzp_test_abc123def456"}}), 400)
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{"key_id": "pk_live_x", "key_secret": "s", "webhook_secret": "w"}}), 400)
+	const rpSecret, rpHook = "razorpay-key-secret-9876", "razorpay-webhook-secret-5432"
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{
+		"key_id": "rzp_test_abc123def456", "key_secret": rpSecret, "webhook_secret": rpHook}}), 204)
+	pr := e.want(e.do("GET", "/v1/admin/settings/payments", adm, nil), 200)
+	if strings.Contains(pr.Raw, rpSecret) || strings.Contains(pr.Raw, rpHook) || s(m(pr.Body["razorpay"])["key_secret"]) != "••••9876" ||
+		s(pr.Body["source"]) != "admin" || s(pr.Body["active"]) != "razorpay" || m(pr.Body["razorpay"])["live"] != false {
+		t.Fatalf("saved payment settings: %s", pr.Raw)
+	}
+	var sdoc bson.M
+	_ = e.a.M.DB.Collection("platform_settings").FindOne(ctx, bson.M{"_id": "payment_gateway"}).Decode(&sdoc)
+	if raw, _ := bson.MarshalExtJSON(sdoc, false, false); strings.Contains(string(raw), rpSecret) || strings.Contains(string(raw), rpHook) {
+		t.Fatalf("secrets stored in plain text: %s", raw)
+	}
+	// A blank secret keeps the saved one; switching back keeps Razorpay's keys.
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "mock", "razorpay": map[string]any{"key_id": "rzp_test_abc123def456", "key_secret": ""}}), 204)
+	if set, _ := gateway.Load(ctx, e.a.M.DB, e.a.Box, e.a.Cfg); set.Active != "mock" || set.RazorpayKeySecret != rpSecret || set.RazorpayWebhookSecret != rpHook {
+		t.Fatalf("settings after switch: %+v", set.Active)
+	}
+	e.want(e.do("POST", "/v1/admin/settings/payments/test", adm, map[string]any{"provider": "paypal"}), 400)
+	au2 := e.want(e.do("GET", "/v1/admin/audit", adm, nil), 200)
+	if !strings.Contains(au2.Raw, "payment_settings_changed") || strings.Contains(au2.Raw, rpSecret) {
+		t.Fatalf("payment settings audit: %s", au2.Raw)
+	}
+
 	sx := e.want(e.do("POST", "/v1/sync", tok, map[string]any{}), 200).Body
 	if s(m(sx["entitlements"])["plan"]) != "academy" || m(m(sx["entitlements"])["features"])["export"] != false {
 		t.Fatalf("admin changes not in entitlements: %v", sx["entitlements"])

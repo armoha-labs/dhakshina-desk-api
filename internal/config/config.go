@@ -50,7 +50,7 @@ func Load() (*Config, error) {
 		Role:                or(os.Getenv("ROLE"), "all"),
 		MongoURI:            os.Getenv("MONGODB_URI"),
 		MongoAdminURI:       os.Getenv("MONGODB_ADMIN_URI"),
-		MongoDB:             or(os.Getenv("MONGODB_DB"), "dhakshina_desk"),
+		MongoDB:             or(os.Getenv("MONGODB_DB"), defaultMongoDB(os.Getenv("APP_ENV"))),
 		WebBaseURL:          strings.TrimRight(or(os.Getenv("WEB_BASE_URL"), "http://localhost:3000"), "/"),
 		APIBaseURL:          strings.TrimRight(or(os.Getenv("API_BASE_URL"), "http://localhost:8080"), "/"),
 		AdminUsers:          os.Getenv("ADMIN_USERS"),
@@ -93,6 +93,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("PAYMENT_GATEWAY=mock cannot be used in production")
 	}
 	return c, nil
+}
+
+// defaultMongoDB keeps development data out of the production database name.
+func defaultMongoDB(env string) string {
+	if env == "production" {
+		return "dhakshina_desk"
+	}
+	return "dhakshinadeskdev"
 }
 
 func (c *Config) secret(name string) (string, error) {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/armohalabs/dhakshina-desk-api/internal/app"
 	"github.com/armohalabs/dhakshina-desk-api/internal/changelog"
@@ -20,6 +21,7 @@ import (
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/store"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/val"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/whatsapp"
+	"github.com/armohalabs/dhakshina-desk-api/internal/privacy"
 )
 
 const maxAttempts = 6
@@ -63,6 +65,41 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
+func (w *Worker) eraseAccount(ctx context.Context, j bson.M) error {
+	if err := privacy.EraseAccount(ctx, w.M.DB, val.Str(j["ref"])); err != nil {
+		return err
+	}
+	return jobs.Finish(ctx, w.M.DB, j["_id"], "erased")
+}
+
+// QueueOpenErasures gives every open account_erase request without a live job
+// a new one: requests from before this job existed, and ones whose job ran out
+// of attempts. A deletion the user asked for must not stay open for good.
+func (w *Worker) QueueOpenErasures(ctx context.Context) error {
+	cur, err := w.M.C("data_requests").Find(ctx, bson.M{"kind": privacy.AccountErase, "status": "open"}, options.Find().SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return err
+	}
+	var open []bson.M
+	if err := cur.All(ctx, &open); err != nil {
+		return err
+	}
+	for _, r := range open {
+		ref := val.Str(r["_id"])
+		n, err := w.M.C("jobs").CountDocuments(ctx, bson.M{"kind": jobs.EraseAccount, "ref": ref, "status": bson.M{"$in": bson.A{jobs.Queued, jobs.Running}}})
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			continue
+		}
+		if err := jobs.Enqueue(ctx, w.M.DB, jobs.Job{Kind: jobs.EraseAccount, Ref: ref}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RunOne runs the next due job; false when there was none.
 func (w *Worker) RunOne(ctx context.Context) (bool, error) {
 	j, err := jobs.Claim(ctx, w.M.DB, w.name)
@@ -94,6 +131,8 @@ func (w *Worker) handle(ctx context.Context, j bson.M) {
 		err = w.processEvent(jctx, j)
 	case jobs.DailyTenant:
 		err = w.dailyTenant(jctx, j)
+	case jobs.EraseAccount:
+		err = w.eraseAccount(jctx, j)
 	default:
 		err = jobs.Fail(jctx, w.M.DB, id, "unknown job kind")
 	}

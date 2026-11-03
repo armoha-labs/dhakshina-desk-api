@@ -1,6 +1,7 @@
-// Package gateway holds the subscription payment gateways. Cashfree or
-// Razorpay is still Arun's call, so both sit behind one interface and
-// PAYMENT_GATEWAY picks one. The mock gateway is for local runs only.
+// Package gateway holds the subscription payment gateways. Razorpay and
+// Cashfree sit behind one interface; the platform admin picks one and saves
+// its keys (see Settings), else PAYMENT_GATEWAY picks one. The mock gateway
+// is for local runs only.
 package gateway
 
 import (
@@ -50,21 +51,8 @@ type Gateway interface {
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
-// ByName returns the configured gateway with that name, or nil.
-func ByName(cfg *config.Config, name string) Gateway {
-	switch name {
-	case "razorpay":
-		return &Razorpay{KeyID: cfg.RazorpayKeyID, KeySecret: cfg.RazorpayKeySecret, WebhookSecret: cfg.RazorpayWebhookKey}
-	case "cashfree":
-		return &Cashfree{AppID: cfg.CashfreeAppID, Secret: cfg.CashfreeSecretKey, Production: cfg.CashfreeEnv == "production"}
-	case "mock":
-		if cfg.IsProd() {
-			return nil
-		}
-		return &Mock{APIBase: cfg.APIBaseURL}
-	}
-	return nil
-}
+// ByName returns the environment's gateway with that name, or nil.
+func ByName(cfg *config.Config, name string) Gateway { return FromConfig(cfg).For(cfg, name) }
 
 // Razorpay ---------------------------------------------------------------
 
