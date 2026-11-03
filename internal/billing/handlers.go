@@ -15,7 +15,6 @@ import (
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/db"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/httpx"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/val"
-	"github.com/armohalabs/dhakshina-desk-api/internal/platform/whatsapp"
 )
 
 func (s *Service) Routes(r chi.Router) {
@@ -129,7 +128,11 @@ func (s *Service) invoice(w http.ResponseWriter, r *http.Request) error {
 // Events we ignore still get 200, so the gateway stops retrying.
 func (s *Service) webhook(w http.ResponseWriter, r *http.Request) error {
 	provider := chi.URLParam(r, "provider")
-	gw := gateway.ByName(s.Cfg, provider)
+	set, err := gateway.Load(r.Context(), s.M.DB, s.Box, s.Cfg)
+	if err != nil {
+		return err
+	}
+	gw := set.For(s.Cfg, provider)
 	if gw == nil || gw.Name() == "mock" {
 		return httpx.Err(httpx.NotFound, "Unknown gateway.")
 	}
@@ -184,26 +187,18 @@ func (s *Service) mockPay(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// upgradeLink: the app shows no prices or checkout (Play policy). "Manage
-// plan" asks the server to send the owner a signed checkout link on WhatsApp.
+// upgradeLink returns a signed checkout link for the class owner. The app's
+// plan button opens it in the browser, where payment happens, so the owner
+// lands on checkout already signed in. The link lasts 14 days.
 func (s *Service) upgradeLink(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.Teacher(r)
 	if err != nil {
 		return err
 	}
+	if p.Role != "owner" {
+		return httpx.Err(httpx.Forbidden, "Only the class owner can change the plan.")
+	}
 	tok, _ := s.Links.Upgrade(p.TenantID, p.UserID)
-	var user bson.M
-	_ = s.M.C("users").FindOne(r.Context(), bson.M{"_id": p.UserID}).Decode(&user)
-	if phone := s.Box.DecryptOr(user["phone_enc"]); phone != "" {
-		if _, err := s.WA.SendTemplate(r.Context(), phone, whatsapp.Template{Name: "dd_plan_link", ButtonURLSuffix: tok}); err != nil {
-			return httpx.Err(httpx.ServerError, "We could not send the link just now. Please try again.")
-		}
-	}
-	out := bson.M{"sent": true}
-	// The URL is returned only outside production, so the app never shows a payment link.
-	if !s.Cfg.IsProd() {
-		out["dev_url"] = s.WebURL("/subscribe/" + tok)
-	}
-	httpx.JSON(w, 200, out)
+	httpx.JSON(w, 200, bson.M{"url": s.WebURL("/subscribe/" + tok)})
 	return nil
 }

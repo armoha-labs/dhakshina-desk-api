@@ -67,6 +67,7 @@ func Ensure(ctx context.Context, db *mongo.Database) error {
 		{"data_requests", k("tenant_id", 1, "status", 1), nil},
 		{"usage_counters", k("tenant_id", 1, "month", 1), u()},
 		{"invoices", k("tenant_id", 1, "created_at", -1), nil},
+		{"invoices", k("status", 1, "paid_at", 1), nil},
 		{"audit_log", k("at", -1), nil},
 		{"audit_log", k("tenant_id", 1, "at", -1), nil},
 		{"tenants", k("plan", 1, "trial_ends_on", 1), nil},

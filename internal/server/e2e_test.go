@@ -21,6 +21,7 @@ import (
 
 	"github.com/armohalabs/dhakshina-desk-api/internal/admin"
 	"github.com/armohalabs/dhakshina-desk-api/internal/app"
+	"github.com/armohalabs/dhakshina-desk-api/internal/billing/gateway"
 	"github.com/armohalabs/dhakshina-desk-api/internal/config"
 	"github.com/armohalabs/dhakshina-desk-api/internal/indexes"
 	"github.com/armohalabs/dhakshina-desk-api/internal/platform/db"
@@ -114,6 +115,49 @@ func m(v any) map[string]any { x, _ := v.(map[string]any); return x }
 func l(v any) []any          { x, _ := v.([]any); return x }
 func s(v any) string         { x, _ := v.(string); return x }
 func n(v any) int64          { x, _ := v.(float64); return int64(x) }
+
+// The income report is staff only, counts only paid invoices and is logged.
+func TestRevenueReport(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	teacher := s(e.login("9000000021")["access_token"])
+	adm := s(e.want(e.do("POST", "/v1/admin/login", "", map[string]any{"email": "staff@example.com", "password": "correct horse battery"}), 200).Body["token"])
+	e.want(e.do("GET", "/v1/admin/revenue", "", nil), 401)
+	e.want(e.do("GET", "/v1/admin/revenue", teacher, nil), 401)
+
+	now := time.Now()
+	tid := ids.UUIDv7()
+	if _, err := e.a.M.C("tenants").InsertOne(ctx, bson.M{"_id": tid, "name": "Paying", "plan": "pro", "status": "active"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, inv := range []bson.M{
+		{"status": "paid", "tenant_id": tid, "paid_at": now},
+		{"status": "created", "tenant_id": tid, "created_at": now},
+		{"status": "paid", "tenant_id": ids.UUIDv7(), "paid_at": now.Add(-40 * 24 * time.Hour)}, // class since erased
+	} {
+		inv["_id"], inv["plan"], inv["billing"], inv["price"], inv["amount"] = ids.UUIDv7(), "pro", "monthly", int64(24900), int64(24900)
+		if _, err := e.a.M.C("invoices").InsertOne(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := e.want(e.do("GET", "/v1/admin/revenue?months=6", adm, nil), 200).Body
+	if n(r["collected"]) != 49800 || n(r["recurring"]) != 24900 || n(r["paying_classes"]) != 1 {
+		t.Fatalf("report: %v", r)
+	}
+	if len(l(r["months"])) != 6 || len(l(r["recent"])) != 2 || len(l(r["plans"])) != 3 {
+		t.Fatalf("report shape: %v", r)
+	}
+	if s(m(l(r["recent"])[0])["class"]) != "Paying" || s(m(l(r["recent"])[1])["class"]) != "" {
+		t.Errorf("recent: %v", r["recent"])
+	}
+	if got := len(l(e.want(e.do("GET", "/v1/admin/revenue", adm, nil), 200).Body["months"])); got != 12 {
+		t.Errorf("default months: %d", got)
+	}
+	n, err := e.a.M.C("audit_log").CountDocuments(ctx, bson.M{"action": "revenue_viewed"})
+	if err != nil || n != 2 {
+		t.Errorf("audit rows: %d, %v", n, err)
+	}
+}
 
 func (e *env) login(phone string) map[string]any {
 	st := e.want(e.do("POST", "/v1/auth/otp/start", "", map[string]any{"phone": phone}), 200).Body
@@ -477,7 +521,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// Upgrade link, quote, mock checkout, webhook-free mock pay.
 	up := e.want(e.do("POST", "/v1/links/upgrade", tok, nil), 200).Body
-	utok := s(up["dev_url"])[len("https://web.test/subscribe/"):]
+	utok := s(up["url"])[len("https://web.test/subscribe/"):]
 	q := e.want(e.do("GET", "/v1/billing/quote?plan=pro&billing=yearly&token="+utok, "", nil), 200).Body
 	if n(m(q["quote"])["amount"]) != 249900 || m(q["plans"])["pro"] == nil || m(q["tenant"])["students"] == nil {
 		t.Fatalf("quote: %v", q)
@@ -598,6 +642,39 @@ func TestEndToEnd(t *testing.T) {
 	if len(l(au["rows"])) < 6 {
 		t.Fatalf("audit rows: %d", len(l(au["rows"])))
 	}
+	// Payment settings: environment first, then saved from the console with
+	// secrets encrypted and never shown back.
+	ps := e.want(e.do("GET", "/v1/admin/settings/payments", adm, nil), 200).Body
+	if s(ps["source"]) != "env" || s(ps["active"]) != "mock" || s(m(ps["razorpay"])["webhook_url"]) == "" {
+		t.Fatalf("payment settings: %v", ps)
+	}
+	e.want(e.do("GET", "/v1/admin/settings/payments", tok, nil), 401)
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{"key_id": "rzp_test_abc123def456"}}), 400)
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{"key_id": "pk_live_x", "key_secret": "s", "webhook_secret": "w"}}), 400)
+	const rpSecret, rpHook = "razorpay-key-secret-9876", "razorpay-webhook-secret-5432"
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "razorpay", "razorpay": map[string]any{
+		"key_id": "rzp_test_abc123def456", "key_secret": rpSecret, "webhook_secret": rpHook}}), 204)
+	pr := e.want(e.do("GET", "/v1/admin/settings/payments", adm, nil), 200)
+	if strings.Contains(pr.Raw, rpSecret) || strings.Contains(pr.Raw, rpHook) || s(m(pr.Body["razorpay"])["key_secret"]) != "••••9876" ||
+		s(pr.Body["source"]) != "admin" || s(pr.Body["active"]) != "razorpay" || m(pr.Body["razorpay"])["live"] != false {
+		t.Fatalf("saved payment settings: %s", pr.Raw)
+	}
+	var sdoc bson.M
+	_ = e.a.M.DB.Collection("platform_settings").FindOne(ctx, bson.M{"_id": "payment_gateway"}).Decode(&sdoc)
+	if raw, _ := bson.MarshalExtJSON(sdoc, false, false); strings.Contains(string(raw), rpSecret) || strings.Contains(string(raw), rpHook) {
+		t.Fatalf("secrets stored in plain text: %s", raw)
+	}
+	// A blank secret keeps the saved one; switching back keeps Razorpay's keys.
+	e.want(e.do("POST", "/v1/admin/settings/payments", adm, map[string]any{"active": "mock", "razorpay": map[string]any{"key_id": "rzp_test_abc123def456", "key_secret": ""}}), 204)
+	if set, _ := gateway.Load(ctx, e.a.M.DB, e.a.Box, e.a.Cfg); set.Active != "mock" || set.RazorpayKeySecret != rpSecret || set.RazorpayWebhookSecret != rpHook {
+		t.Fatalf("settings after switch: %+v", set.Active)
+	}
+	e.want(e.do("POST", "/v1/admin/settings/payments/test", adm, map[string]any{"provider": "paypal"}), 400)
+	au2 := e.want(e.do("GET", "/v1/admin/audit", adm, nil), 200)
+	if !strings.Contains(au2.Raw, "payment_settings_changed") || strings.Contains(au2.Raw, rpSecret) {
+		t.Fatalf("payment settings audit: %s", au2.Raw)
+	}
+
 	sx := e.want(e.do("POST", "/v1/sync", tok, map[string]any{}), 200).Body
 	if s(m(sx["entitlements"])["plan"]) != "academy" || m(m(sx["entitlements"])["features"])["export"] != false {
 		t.Fatalf("admin changes not in entitlements: %v", sx["entitlements"])

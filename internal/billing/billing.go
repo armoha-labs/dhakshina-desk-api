@@ -28,7 +28,8 @@ type Service struct{ *app.App }
 
 const day = 24 * time.Hour
 
-func term(billing string) time.Duration {
+// Term is how long one payment covers.
+func Term(billing string) time.Duration {
 	if billing == "yearly" {
 		return 365 * day
 	}
@@ -48,10 +49,10 @@ func ProRataCredit(t bson.M, now time.Time) int64 {
 	if left <= 0 {
 		return 0
 	}
-	if left > term(billing) {
-		left = term(billing)
+	if left > Term(billing) {
+		left = Term(billing)
 	}
-	return int64(float64(last) * float64(left) / float64(term(billing)))
+	return int64(float64(last) * float64(left) / float64(Term(billing)))
 }
 
 type Quote struct {
@@ -78,10 +79,15 @@ func QuoteFor(t bson.M, plan, billing string, now time.Time) (Quote, error) {
 	return Quote{Plan: plan, Billing: billing, Price: price, Credit: credit, Amount: max(price-credit, 100)}, nil
 }
 
-func (s *Service) gateway() (gateway.Gateway, error) {
-	g := gateway.ByName(s.Cfg, s.Cfg.Gateway)
+// gateway is the one the platform admin made active.
+func (s *Service) gateway(ctx context.Context) (gateway.Gateway, error) {
+	set, err := gateway.Load(ctx, s.M.DB, s.Box, s.Cfg)
+	if err != nil {
+		return nil, err
+	}
+	g := set.For(s.Cfg, set.Active)
 	if g == nil {
-		return nil, fmt.Errorf("payment gateway %q is not available", s.Cfg.Gateway)
+		return nil, fmt.Errorf("payment gateway %q is not available", set.Active)
 	}
 	return g, nil
 }
@@ -99,7 +105,7 @@ func (s *Service) CreateCheckout(ctx context.Context, tenantID, userID, plan, bi
 	if err != nil {
 		return nil, err
 	}
-	gw, err := s.gateway()
+	gw, err := s.gateway(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +173,7 @@ func (s *Service) MarkInvoicePaid(ctx context.Context, invoiceID, providerPaymen
 				from = pu
 			}
 		}
-		paidUntil := from.Add(term(billing))
+		paidUntil := from.Add(Term(billing))
 		year := now.In(val.IST).Year()
 		var counter bson.M
 		if err := s.M.C("counters").FindOneAndUpdate(ctx, bson.M{"_id": fmt.Sprintf("gst_invoice_%d", year)}, bson.M{"$inc": bson.M{"seq": 1}},

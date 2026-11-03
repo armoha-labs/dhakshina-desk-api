@@ -76,8 +76,8 @@ The end-to-end test (`internal/server/e2e_test.go`) creates and drops its own
 database. It covers login, class setup, sync (all rejection codes, last-writer
 wins, partial upserts, receipt numbers, message cancel, gzip), the parent page,
 claims and consent, plan limits, the mock checkout, the WhatsApp worker and
-status webhook, the daily scheduler, every admin call, tenant isolation and
-account deletion. `internal/compat` checks that phone ciphertexts, blind
+status webhook, the daily scheduler, every admin call, the income report,
+tenant isolation and account deletion. `internal/compat` checks that phone ciphertexts, blind
 indexes, signed links, admin hashes and charge ids made by the Node server
 read the same in Go.
 
@@ -85,7 +85,9 @@ read the same in Go.
 
 All settings come from the environment (see `.env.example`). The MongoDB
 connection string is only ever set through the environment or the host's
-secret store, never committed. The database is `dhakshina_desk` on the same
+secret store, never committed. The database follows `APP_ENV`:
+`dhakshinadeskdev` on a local replica set in development, and `dhakshina_desk`
+in production (`MONGODB_DB` overrides this), on the same
 Atlas cluster as Yummverse.
 
 Moving from the Next.js server: reuse its `JWT_SECRET`, `LINK_SECRET` and
@@ -94,8 +96,9 @@ encrypted phone numbers stop working.
 
 For the admin console, set `MONGODB_ADMIN_URI` to a database user whose role
 can read only `tenants`, `plans`, `subscriptions`, `invoices`,
-`usage_counters` and `audit_log`, insert into `audit_log` and update
-`tenants`. The database then refuses student, guardian, ledger and message
+`usage_counters`, `audit_log` and `platform_settings`, insert into
+`audit_log`, update `tenants` and write `platform_settings` (the payment
+gateway settings, secrets encrypted with `FIELD_ENC_KEY`). The database then refuses student, guardian, ledger and message
 reads even if the admin code has a bug.
 
 ## Routes
