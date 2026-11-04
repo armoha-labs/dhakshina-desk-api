@@ -143,13 +143,28 @@ Templates to create in WhatsApp Manager are listed in
 
 ## Hosting
 
-Deferred. The image is a static binary on distroless (about 23 MB) and runs
-anywhere that runs a container: `docker build -t dhakshina-desk-api .`, then
-run with the environment set. It listens on `$PORT` (default 8080). At launch
-one process runs both roles (`ROLE=all`); later run `ROLE=api` and
+The image is a static binary on distroless (about 23 MB) and runs anywhere
+that runs a container: `docker build -t dhakshina-desk-api .`, then run with
+the environment set. It listens on `$PORT` (default 8080). At launch one
+process runs both roles (`ROLE=all`); in production run `ROLE=api` and
 `ROLE=worker` from the same image. Point the gateway webhooks at
 `https://<api host>/v1/billing/webhook/razorpay` (or `/cashfree`) and Meta's
 webhook at `https://<api host>/v1/webhooks/whatsapp`.
+
+### Render
+
+`render.yaml` is a Blueprint that deploys the Docker image as two services —
+a web service (`ROLE=api`, health-checked at `/v1/health`) and a worker
+(`ROLE=worker`) — sharing one env group so secrets stay identical across both.
+The web service runs `dhakshina indexes` as a pre-deploy step on each deploy.
+
+1. In Render, create a Blueprint from this repo (**New → Blueprint**).
+2. Fill every `sync: false` value in the `dhakshina-desk` env group: at least
+   `MONGODB_URI`, `API_BASE_URL`, `WEB_BASE_URL`, the four secrets, and
+   `ADMIN_USERS`. Set `API_BASE_URL` to the web service's own URL
+   (`https://dhakshina-desk-api.onrender.com`).
+3. Deploy. MongoDB is external — point `MONGODB_URI` at the Atlas cluster;
+   Render does not host it.
 
 ## Not built yet
 
