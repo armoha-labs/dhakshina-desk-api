@@ -1,0 +1,105 @@
+# Render Blueprint for the Dhakshina Desk backend.
+#
+# One Docker image (the repo Dockerfile) runs as two services that split the
+# roles the binary already supports:
+#   - web:    ROLE=api,    serves HTTP, health-checked at /v1/health
+#   - worker: ROLE=worker, runs the queue sender and daily scheduler
+# They share one env group so secrets (JWT, encryption keys, Mongo URI) are
+# identical across both; tokens, signed links and encrypted fields depend on
+# that. MongoDB is external (the Atlas cluster), set in the group below.
+#
+# First deploy: create the services from this blueprint, then fill every
+# `sync: false` value in the dashboard before promoting. The web service runs
+# `dhakshina indexes` as a pre-deploy step (idempotent) on each deploy.
+services:
+  - type: web
+    name: dhakshina-desk-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: singapore # closest Render region to India
+    plan: starter
+    healthCheckPath: /v1/health
+    preDeployCommand: "/dhakshina indexes"
+    envVars:
+      - key: ROLE
+        value: api
+      - fromGroup: dhakshina-desk
+
+  - type: worker
+    name: dhakshina-desk-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: singapore
+    plan: starter
+    envVars:
+      - key: ROLE
+        value: worker
+      - fromGroup: dhakshina-desk
+
+envVarGroups:
+  - name: dhakshina-desk
+    envVars:
+      # Render injects PORT into the web service; the binary listens on $PORT.
+      - key: APP_ENV
+        value: production
+
+      # MongoDB — the Atlas cluster. MONGODB_DB defaults to dhakshina_desk in
+      # production, so only set MONGODB_DB to override that.
+      - key: MONGODB_URI
+        sync: false
+      # Optional: a least-privilege user for the admin console.
+      - key: MONGODB_ADMIN_URI
+        sync: false
+
+      # Public origins. API_BASE_URL is this service's own https origin
+      # (e.g. https://dhakshina-desk-api.onrender.com); gateway webhooks and
+      # mock pay links are built from it. WEB_BASE_URL is the website.
+      - key: API_BASE_URL
+        sync: false
+      - key: WEB_BASE_URL
+        sync: false
+
+      # Secrets. Reuse the values the Next.js server used for JWT_SECRET,
+      # LINK_SECRET and FIELD_ENC_KEY, or existing sessions, links already sent
+      # and encrypted phone numbers stop working. Generate fresh ones with
+      # `openssl rand -base64 32`.
+      - key: JWT_SECRET
+        sync: false
+      - key: LINK_SECRET
+        sync: false
+      - key: FIELD_ENC_KEY
+        sync: false
+      - key: ADMIN_TOKEN_SECRET
+        sync: false
+      # Platform admin: comma-separated email=hash pairs
+      # (dhakshina admin-hash '<password>').
+      - key: ADMIN_USERS
+        sync: false
+
+      # Subscription gateway. mock is refused in production; production can
+      # start with razorpay and empty keys, then set the keys in the admin
+      # console (or here) once they exist.
+      - key: PAYMENT_GATEWAY
+        value: razorpay
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: CASHFREE_APP_ID
+        sync: false
+      - key: CASHFREE_SECRET_KEY
+        sync: false
+      - key: CASHFREE_ENV
+        value: production
+
+      # WhatsApp Cloud API. Leave the token empty to log sends instead.
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
